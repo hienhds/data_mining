@@ -219,7 +219,7 @@ def main():
 
         # 5. Lưu mô hình
         saver = tf.train.Saver()
-        saver.save(sess, ".saved_model/kgat_model.ckpt")
+        saver.save(sess, "saved_model/kgat_model.ckpt")
         print("✅ Model saved compelete")
 
 
