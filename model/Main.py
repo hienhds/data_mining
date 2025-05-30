@@ -5,7 +5,11 @@ import numpy as np
 from KGAT import KGAT
 from argparse import Namespace
 import random
-
+from tqdm import tqdm
+from sklearn.model_selection import KFold
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from collections import defaultdict
+import heapq
 
 def load_data_from_mysql():
     # 1. Kết nối MySQL
@@ -20,95 +24,179 @@ def load_data_from_mysql():
     # 2. Đọc nodes và embedding
     cursor.execute("SELECT id, node_type, embedding FROM nodes")
     node_rows = cursor.fetchall()
-    
-    node2idx = {}
+
+    # Tìm số lượng node
+    max_id = max(row['id'] for row in node_rows)
+    embedding_dim = len(np.frombuffer(node_rows[0]['embedding'], dtype=np.float32))
+    embedding_matrix = np.zeros((max_id + 1, embedding_dim), dtype=np.float32)
     type_dict = {}
-    embedding_list = []
 
-    for idx, row in enumerate(node_rows):
-        node_id = row['id']
-        node2idx[node_id] = idx
-        type_dict[node_id] = row['node_type']
+    for row in node_rows:
+        nid = row['id']
+        type_dict[nid] = row['node_type']
+        embedding_matrix[nid] = np.frombuffer(row['embedding'], dtype=np.float32)
 
-        # Decode BLOB (assumed float32 vector)
-        vec = np.frombuffer(row['embedding'], dtype=np.float32)
-        embedding_list.append(vec)
+    # Phân loại node
+    user_ids = [nid for nid, t in type_dict.items() if t == 'candidate']
+    job_ids  = [nid for nid, t in type_dict.items() if t == 'job']
+    n_users  = len(user_ids)
+    n_jobs   = len(job_ids)
+    n_nodes = max_id + 1
 
-    # Stack all embeddings into a matrix
-    embedding_matrix = np.vstack(embedding_list).astype(np.float32)
-
-    # Xác định các node là candidate và position
-    user_ids = [nid for nid in type_dict if type_dict[nid] == 'candidate']
-    job_ids = [nid for nid in type_dict if type_dict[nid] == 'job']
-    n_users = len(user_ids)
-    n_jobs = len(job_ids)
-    n_nodes = len(node_rows)
-
-    # Mapping user/job ids sang index trong embedding_matrix
-    user_embed = embedding_matrix[[node2idx[nid] for nid in user_ids]]
-    job_embed = embedding_matrix[[node2idx[nid] for nid in job_ids]]
-
-    # Các node còn lại (non-job entities)
-    job_indices = set(node2idx[nid] for nid in job_ids)
-    entity_indices = [i for i in range(n_nodes) if i not in job_indices]
-    entity_embed = embedding_matrix[entity_indices]
+    # Tạo embedding riêng
+    user_embed   = embedding_matrix[user_ids]
+    job_embed    = embedding_matrix[job_ids]
+    entity_embed = embedding_matrix  # toàn bộ node embedding
 
     # 3. Đọc relations và embedding
-    cursor.execute("SELECT id, relation_name, embedding FROM relations")
+    cursor.execute("SELECT id, embedding FROM relations")
     rel_rows = cursor.fetchall()
 
-    rel2id = {}
-    relation_embed_list = []
-    for row in rel_rows:
-        rel2id[row['id']] = row['relation_name']
-        vec = np.frombuffer(row['embedding'], dtype=np.float32)
-        relation_embed_list.append(vec)
+    relation_embed = np.vstack([
+        np.frombuffer(r['embedding'], dtype=np.float32)
+        for r in rel_rows
+    ]).astype(np.float32)
 
-    relation_embed = np.vstack(relation_embed_list).astype(np.float32)
-    n_relations = len(rel2id)
+    n_relations = len(rel_rows)
 
     # 4. Đọc edges
     cursor.execute("SELECT head_node_id, relation_id, tail_node_id FROM edges")
     edge_rows = cursor.fetchall()
 
-    all_h_list, all_r_list, all_t_list = [], [], []
-    row_idx, col_idx, edge_val = [], [], []
+    # Tạo ánh xạ ngược từ ID sang index riêng cho CF
+    user2cf = {nid: i for i, nid in enumerate(user_ids)}
+    job2cf  = {nid: i for i, nid in enumerate(job_ids)}
 
+    # 4a. CF triples: chỉ lấy quan hệ job <-> candidate với relation_id = 3 (HAS_EXPERIENCE)
+    cf_h, cf_t = [], []
     for row in edge_rows:
-        h_idx = node2idx[row['head_node_id']]
-        t_idx = node2idx[row['tail_node_id']]
-        r_id = row['relation_id'] - 1
+        h_id, t_id = row['head_node_id'], row['tail_node_id']
+        h_type, t_type = type_dict[h_id], type_dict[t_id]
+        r = row['relation_id']
 
-        all_h_list.append(h_idx)
-        all_r_list.append(r_id)
-        all_t_list.append(t_idx)
+        if r == 3:
+            if h_type == 'job' and t_type == 'candidate':
+                cf_h.append(job2cf[h_id])
+                cf_t.append(user2cf[t_id])
+            elif h_type == 'candidate' and t_type == 'job':
+                cf_h.append(job2cf[t_id])
+                cf_t.append(user2cf[h_id])
 
-        row_idx.append(h_idx)
-        col_idx.append(t_idx)
-        edge_val.append(1.0)
-
-    # 5. Xây ma trận A_in
-    A = sp.coo_matrix(
-        (edge_val + edge_val, (row_idx + col_idx, col_idx + row_idx)),
-        shape=(n_nodes, n_nodes), dtype=np.float32
+    # Nếu cần tạo ma trận A_cf 
+    A_cf = sp.coo_matrix(
+        (np.ones(len(cf_h + cf_t), dtype=np.float32), (cf_h + cf_t, cf_t + cf_h)),
+        shape=(n_jobs + n_users, n_jobs + n_users)
     )
 
-    # 6. Trả về data_config
+    # 4b. KG triples: toàn bộ đồ thị
+    h_kg = [row['head_node_id'] for row in edge_rows]
+    t_kg = [row['tail_node_id'] for row in edge_rows]
+    kg_rel = [row['relation_id'] for row in edge_rows]
+
+
+    rows, cols = h_kg + t_kg, t_kg + h_kg
+    A_kg = sp.coo_matrix(
+        (np.ones(len(rows), dtype=np.float32), (rows, cols)),
+        shape=(n_nodes, n_nodes)
+    )
+
     return {
-        'n_jobs': n_jobs,
         'n_users': n_users,
-        'n_entities': len(entity_embed),
+        'n_jobs': n_jobs,
+        'n_entities': n_nodes,
         'n_relations': n_relations,
-        'A_in': A,
-        'job_embed': job_embed,
+        'A_cf': A_cf,
+        'A_kg': A_kg,
         'user_embed': user_embed,
+        'job_embed': job_embed,
         'entity_embed': entity_embed,
         'relation_embed': relation_embed,
-        'all_h_list': all_h_list,
-        'all_r_list': all_r_list,
-        'all_t_list': all_t_list,
-        'all_v_list': [1.0] * len(all_h_list)
+        'cf_triples': (cf_h, [0]*len(cf_h), cf_t),
+        'kg_triples': (h_kg, kg_rel, t_kg),
+        'user2cf': user2cf,
+        'job2cf': job2cf
     }
+
+def evaluate_metrics(model, sess, job2cf, user2cf, test_pairs):
+    y_true, y_pred, y_score = [], [], []
+    for pair in test_pairs:
+        job, user, label = pair['job'], pair['user'], pair['label']
+        if job not in job2cf or user not in user2cf:
+            continue
+        feed = {
+            model.jobs: [job2cf[job]],
+            model.pos_users: [user2cf[user]],
+            model.neg_users: [user2cf[user]],
+            model.node_dropout: [0.0] * model.n_layers,
+            model.mess_dropout: [0.0] * model.n_layers
+        }
+        score = sess.run(model.batch_predictions, feed_dict=feed)[0][0]
+        y_score.append(score)
+        y_pred.append(1 if score >= 0.5 else 0)
+        y_true.append(label)
+    return {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "precision": precision_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred),
+        "f1": f1_score(y_true, y_pred),
+        "auc": roc_auc_score(y_true, y_score)
+    }
+
+from collections import defaultdict
+import heapq
+
+def recall_at_k(ranked_list, ground_truth, k):
+    return len(set(ranked_list[:k]) & set(ground_truth)) / float(len(ground_truth))
+
+def ndcg_at_k(ranked_list, ground_truth, k):
+    dcg = 0.0
+    for i in range(k):
+        if ranked_list[i] in ground_truth:
+            dcg += 1.0 / np.log2(i + 2)
+    idcg = sum(1.0 / np.log2(i + 2) for i in range(min(len(ground_truth), k)))
+    return dcg / idcg if idcg > 0 else 0.0
+
+def evaluate_ranking(model, sess, job2cf, user2cf, test_pairs, K_list=[5,10,20]):
+    # Xây index các job từng apply bởi mỗi user
+    user_positive = defaultdict(set)
+    for pair in test_pairs:
+        if pair['label'] == 1:
+            user_positive[pair['user']].add(pair['job'])
+
+    all_jobs = list(job2cf.keys())
+    recall_k_result = {k: [] for k in K_list}
+    ndcg_k_result = {k: [] for k in K_list}
+
+    for user in user_positive:
+        if user not in user2cf:
+            continue
+        gt_jobs = list(user_positive[user])
+        candidate_jobs = [j for j in all_jobs if j not in gt_jobs]
+
+        # Gộp GT + negative sample
+        jobs_to_score = candidate_jobs + gt_jobs
+        feed = {
+            model.jobs: [job2cf[j] for j in jobs_to_score],
+            model.pos_users: [user2cf[user]] * len(jobs_to_score),
+            model.neg_users: [user2cf[user]] * len(jobs_to_score),
+            model.node_dropout: [0.0] * model.n_layers,
+            model.mess_dropout: [0.0] * model.n_layers
+        }
+        scores = sess.run(model.batch_predictions, feed_dict=feed)[0]
+        ranked_jobs = [jobs_to_score[i] for i in np.argsort(scores)[::-1]]
+
+        for k in K_list:
+            recall = recall_at_k(ranked_jobs, gt_jobs, k)
+            ndcg = ndcg_at_k(ranked_jobs, gt_jobs, k)
+            recall_k_result[k].append(recall)
+            ndcg_k_result[k].append(ndcg)
+
+    results = {}
+    for k in K_list:
+        results[f"Recall@{k}"] = np.mean(recall_k_result[k])
+        results[f"nDCG@{k}"] = np.mean(ndcg_k_result[k])
+    return results
+
 
 def generate_cf_batches(data_config, batch_size):
     n_jobs = data_config['n_jobs']
@@ -130,44 +218,74 @@ def generate_cf_batches(data_config, batch_size):
         })
     return batches
 
-def generate_kg_batches(data_config, batch_size):
-    h_list = data_config['all_h_list']
-    r_list = data_config['all_r_list']
-    t_list = data_config['all_t_list']
-    n_entities = data_config['n_entities'] + data_config['n_jobs']
 
+
+def generate_kg_batches(data_config, batch_size):
+    # Lấy KG triples
+    h_list, r_list, t_list = data_config['kg_triples']
+    # Tổng số node trong KG = jobs + entities
+    n_nodes = data_config['n_jobs'] + data_config['n_entities']
+
+    # Ghép thành list triple, shuffle
     triples = list(zip(h_list, r_list, t_list))
     random.shuffle(triples)
 
     batches = []
     for i in range(0, len(triples), batch_size):
         batch = triples[i:i + batch_size]
-        h, r, pos_t = zip(*batch)
-        neg_t = random.choices(range(n_entities), k=len(batch))
-
+        h_b, r_b, pos_t_b = zip(*batch)
+        # Neg sampling: random từ toàn bộ node space
+        neg_t_b = random.choices(list(range(n_nodes)), k=len(batch))
         batches.append({
-            'h': list(h),
-            'r': list(r),
-            'pos_t': list(pos_t),
-            'neg_t': neg_t
+            'h':     list(h_b),
+            'r':     list(r_b),
+            'pos_t': list(pos_t_b),
+            'neg_t': neg_t_b
         })
     return batches
 
+def get_all_job_user_pairs(user2cf, job2cf):
+    conn = mysql.connector.connect(
+        host="localhost", user="root", password="231123", database="cv"
+    )
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT head_node_id, relation_id, tail_node_id FROM edges")
+    rows = cursor.fetchall()
+    conn.close()
+
+    pairs = []
+    for row in rows:
+        h, r, t = row['head_node_id'], row['relation_id'], row['tail_node_id']
+        if r == 3:
+            if h in job2cf and t in user2cf:
+                pairs.append({'job': h, 'user': t, 'label': 1})
+            if t in job2cf and h in user2cf:
+                pairs.append({'job': t, 'user': h, 'label': 1})
+
+    # Sinh negative sample
+    all_jobs = list(job2cf.keys())
+    all_users = list(user2cf.keys())
+    for _ in range(len(pairs)):
+        j = random.choice(all_jobs)
+        u = random.choice(all_users)
+        if {'job': j, 'user': u, 'label': 1} not in pairs:
+            pairs.append({'job': j, 'user': u, 'label': 0})
+
+    return pairs
+
+
 
 def main():
-    # 1. Load dữ liệu từ MySQL → chuẩn hóa thành data_config
+    # Load dữ liệu
     data_config = load_data_from_mysql()
 
-    # 2. Khởi tạo args (tham số mô hình)
-    embed_size = 384
-
     args = Namespace(
-        embed_size=embed_size,
-        kge_size=embed_size,                     # có thể chọn bằng 1/2 hoặc 1/3 embed_size
-        batch_size=256,
-        batch_size_kg=128,
-        lr=0.001,
-        layer_size='[256, 128]',         # nên bắt đầu giảm dần
+        embed_size=384,
+        kge_size=384,
+        batch_size=512,
+        batch_size_kg=1024,
+        lr=0.0001,
+        layer_size='[256, 128]',
         alg_type='kgat',
         adj_type='norm',
         adj_uni_type='sum',
@@ -175,53 +293,69 @@ def main():
         verbose=1
     )
 
+    user2cf = data_config['user2cf']
+    job2cf = data_config['job2cf']
 
-    # 3. Khởi tạo model
-    model = KGAT(data_config=data_config, pretrain_data=None, args=args)
+    all_pairs = get_all_job_user_pairs(user2cf, job2cf)
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    best_auc = 0
+    best_model_path = ""
 
-    # 4. Tạo session và khởi tạo biến
-    config = tf.ConfigProto()
-    config.gpu_options.allow_growth = True
-    with tf.Session(config=config) as sess:
-        sess.run(tf.global_variables_initializer())
+    fold_idx = 1
+    for train_idx, test_idx in kf.split(all_pairs):
+        print(f"\n===== Fold {fold_idx} =====")
+        fold_idx += 1
 
-        for epoch in range(1, 51):
-            print(f"\nEpoch {epoch}")
+        train_pairs = [all_pairs[i] for i in train_idx]
+        test_pairs = [all_pairs[i] for i in test_idx]
 
-            # --------- PHASE I: Collaborative Filtering ---------
-            for cf_batch in generate_cf_batches(data_config, args.batch_size):
-                feed_dict = {
-                    model.jobs: cf_batch['job_ids'],
-                    model.pos_users: cf_batch['pos_user_ids'],
-                    model.neg_users: cf_batch['neg_user_ids'],
-                    model.node_dropout: [0.1] * len(eval(args.layer_size)),
-                    model.mess_dropout: [0.1] * len(eval(args.layer_size))
-                }
-                _, loss, base_loss, kge_loss, reg_loss = model.train(sess, feed_dict)
+        model = KGAT(data_config=data_config, pretrain_data=None, args=args)
 
-            # --------- PHASE II: Knowledge Graph Embedding ---------
-            for kg_batch in generate_kg_batches(data_config, args.batch_size_kg):
-                feed_dict = {
-                    model.h: kg_batch['h'],
-                    model.r: kg_batch['r'],
-                    model.pos_t: kg_batch['pos_t'],
-                    model.neg_t: kg_batch['neg_t']
-                }
-                _, kg_total_loss, kge_loss2, reg_loss2 = model.train_A(sess, feed_dict)
+        config = tf.ConfigProto()
+        config.gpu_options.allow_growth = True
+        with tf.Session(config=config) as sess:
+            sess.run(tf.global_variables_initializer())
 
-            # --------- Cập nhật attention matrix từ KG ---------
-            model.update_attentive_A(sess)
+            for epoch in tqdm(range(1, 101), desc="Training Epochs"):
+                for cf_batch in generate_cf_batches(data_config, args.batch_size):
+                    feed_dict = {
+                        model.jobs: cf_batch['job_ids'],
+                        model.pos_users: cf_batch['pos_user_ids'],
+                        model.neg_users: cf_batch['neg_user_ids'],
+                        model.node_dropout: [0.1] * len(eval(args.layer_size)),
+                        model.mess_dropout: [0.1] * len(eval(args.layer_size))
+                    }
+                    model.train(sess, feed_dict)
 
-            print(f"[Epoch {epoch}] CF Loss: {float(loss):.4f}, KG Loss: {float(kg_total_loss):.4f}")
+                for kg_batch in generate_kg_batches(data_config, args.batch_size_kg):
+                    feed_dict = {
+                        model.h: kg_batch['h'],
+                        model.r: kg_batch['r'],
+                        model.pos_t: kg_batch['pos_t'],
+                        model.neg_t: kg_batch['neg_t']
+                    }
+                    model.train_A(sess, feed_dict)
 
+                model.update_attentive_A(sess)
 
-        print("Training done.")
+            # 🎯 Đánh giá sau mỗi fold
+            metrics = evaluate_metrics(model, sess, job2cf, user2cf, test_pairs)
+            print("📊 Evaluation:", metrics)
+            ranking_metrics = evaluate_ranking(model, sess, job2cf, user2cf, test_pairs)
+            print("📈 Ranking Evaluation:", ranking_metrics)
 
-        # 5. Lưu mô hình
-        saver = tf.train.Saver()
-        saver.save(sess, "saved_model/kgat_model.ckpt")
-        print("✅ Model saved compelete")
+            
+            saver = tf.train.Saver()
+            best_model_path = f"saved_model/best_model_fold{fold_idx-1}.ckpt"
+            saver.save(sess, best_model_path)
+            print(f"🌟 Saved model")
+
 
 
 if __name__ == "__main__":
     main()
+    # data_config = load_data_from_mysql()
+    # print(data_config['A_cf'])
+    # count_ones = np.sum(data_config['A_cf'].data == 1.0)
+    # print(f"Số lượng cạnh có giá trị 1.0 trong A_cf: {count_ones}")
+

@@ -1,1 +1,6 @@
 venv/
+model/saved_model/
+data/candidate.xlsx
+data/experience.xlsx
+data/experience_ids.txt
+model/data_test.json

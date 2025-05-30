@@ -73,18 +73,28 @@ class KGAT(object):
         self.n_users = data_config['n_users']
         self.n_entities = data_config['n_entities']
         self.n_relations  = data_config['n_relations']
-
+        self.A_cf = data_config['A_cf']
+        self.A_kg = data_config['A_kg']
+        self.cf_triples = data_config['cf_triples']
+        self.kg_triples = data_config['kg_triples']
         # chia nho ma tran ke
         self.n_fold = 100
 
         # ma tran ke ban ddau
-        self.A_in = data_config['A_in']
+        # self.A_in = data_config['A_in']
 
-        self.all_h_list = data_config['all_h_list']
-        self.all_r_list = data_config['all_r_list']
-        self.all_t_list = data_config['all_t_list']
-        self.all_v_list = data_config['all_v_list'] # danh sachs rong so ban dau
+        # self.all_h_list = data_config['all_h_list']
+        # self.all_r_list = data_config['all_r_list']
+        # self.all_t_list = data_config['all_t_list']
+        # self.all_v_list = data_config['all_v_list'] # danh sachs rong so ban dau
 
+        # CF triples và KG triples đã load ở data_config
+        self.cf_h, self.cf_r, self.cf_t = data_config['cf_triples']
+        self.kg_h, self.kg_r, self.kg_t = data_config['kg_triples']
+        self.kg_v = [1.0] * len(self.kg_h) 
+
+
+        # dạng chuẩn hóa cho attention (norm)
         self.adj_uni_type = args.adj_uni_type
 
         self.lr = args.lr
@@ -114,7 +124,8 @@ class KGAT(object):
 
         #danh sach trong so cac canh trong ma tran ke dung cho attention
          # for knowledge graph modeling (TransD)
-        self.A_values = tf.placeholder(tf.float32, shape=[len(self.all_v_list)], name='A_values')
+        # self.A_values = tf.placeholder(tf.float32, shape=[len(self.all_v_list)], name='A_values')
+        self.A_values = tf.placeholder(tf.float32, shape=[len(self.kg_v)], name='A_values')
 
         # pha 2: (h + r) ≈ pos_t  nhưng  (h + r) ≠ neg_t
         self.h = tf.placeholder(tf.int32, shape=[None], name='h')
@@ -150,6 +161,23 @@ class KGAT(object):
         
         all_weights['relation_embed'] = tf.Variable(data_config['relation_embed'], trainable=True)
         all_weights['trans_W'] = tf.Variable(initializer([self.n_relations , self.emb_dim, self.kge_dim]))
+        # initializer = tf.contrib.layers.xavier_initializer()
+
+        # # Tổng số entity (job + other entity)
+        # n_entities_total = self.n_jobs + self.n_entities - self.n_users  # vì user và job là riêng
+
+        # # Job và User embedding
+        # all_weights['job_embed'] = tf.Variable(initializer([self.n_jobs, self.emb_dim]), name='job_embed')
+        # all_weights['user_embed'] = tf.Variable(initializer([self.n_users, self.emb_dim]), name='user_embed')
+
+        # # Entity embedding (không bao gồm job)
+        # all_weights['entity_embed'] = tf.Variable(initializer([n_entities_total, self.emb_dim]), name='entity_embed')
+
+        # Relation embedding
+        all_weights['relation_embed'] = tf.Variable(initializer([self.n_relations, self.kge_dim]), name='relation_embed')
+
+        # TransR projection matrix
+        all_weights['trans_W'] = tf.Variable(initializer([self.n_relations , self.emb_dim, self.kge_dim]), name='trans_W')
 
 
         self.weight_size_list = [self.emb_dim] + self.weight_size
@@ -186,10 +214,10 @@ class KGAT(object):
 
     def _build_model_phase_I(self):
         if self.alg_type in ['bi', 'kgat']:
-            self.ja_embeddings, self.ua_embeddings = self._create_bi_interaction_embed()
+            self.ja_embeddings, self.ua_embeddings = self._create_bi_interaction_cf()
 
         elif self.alg_type in ['gcn']:
-            self.ja_embeddings, self.ua_embeddings = self._create_gcn_embed()
+            self.ja_embeddings, self.ua_embeddings = self._create_gcn_cf()
 
         elif self.alg_type in ['graphsage']:
             self.ja_embeddings, self.ua_embeddings = self._create_graphsage_embed()
@@ -197,11 +225,34 @@ class KGAT(object):
             print('please check the the alg_type argument, which should be bi, kgat, gcn, or graphsage.')
             raise NotImplementedError
 
-        self.j_e = tf.nn.embedding_lookup(self.ua_embeddings, self.jobs)
+        self.j_e = tf.nn.embedding_lookup(self.ja_embeddings, self.jobs)
         self.pos_u_e = tf.nn.embedding_lookup(self.ua_embeddings, self.pos_users)
         self.neg_u_e = tf.nn.embedding_lookup(self.ua_embeddings, self.neg_users)
 
         self.batch_predictions = tf.matmul(self.j_e, self.pos_u_e, transpose_a=False, transpose_b=True)
+
+    def _create_bi_interaction_cf(self):
+        A = self.A_cf
+        # split adjacency for CF
+        A_fold = self._split_A_hat(A, self.n_jobs + self.n_users)
+        # embeddings for CF: job + user
+        ego = tf.concat([self.weights['job_embed'], self.weights['user_embed']], axis=0)
+        # rest logic same as bi-interaction but on ego and A_fold
+        all_emb = [ego]
+        for k in range(self.n_layers):
+            temp = []
+            for f in range(self.n_fold):
+                temp.append(tf.sparse_tensor_dense_matmul(A_fold[f], ego))
+            side = tf.concat(temp, 0)
+            sum_emb = tf.nn.leaky_relu(tf.matmul(ego + side, self.weights['W_gc_%d' % k]) + self.weights['b_gc_%d' % k])
+            bi_emb = tf.nn.leaky_relu(tf.matmul(ego * side, self.weights['W_bi_%d' % k]) + self.weights['b_bi_%d' % k])
+            ego = tf.nn.dropout(sum_emb + bi_emb, 1 - self.mess_dropout[k])
+            norm = tf.math.l2_normalize(ego, axis=1)
+            all_emb.append(norm)
+        concat_emb = tf.concat(all_emb, 1)
+        ja, ua = tf.split(concat_emb, [self.n_jobs, self.n_users], 0)
+        return ja, ua
+
 
     def _build_model_phase_II(self):
         # 1. Lấy embedding từ KG triple
@@ -284,110 +335,113 @@ class KGAT(object):
         # Optimization process.
         self.opt2 = tf.train.AdamOptimizer(learning_rate=self.lr).minimize(self.loss2)
 
-    def _create_bi_interaction_embed(self):
-        A = self.A_in
-        # Generate a set of adjacency sub-matrix.
-        A_fold_hat = self._split_A_hat(A)
+    # def _create_bi_interaction_embed(self):
+    #     A = self.A_in
+    #     # Generate a set of adjacency sub-matrix.
+    #     A_fold_hat = self._split_A_hat(A)
 
-        ego_embeddings = tf.concat([self.weights['job_embed'], self.weights['entity_embed']], axis=0)
-        all_embeddings = [ego_embeddings]
+    #     ego_embeddings = tf.concat([self.weights['job_embed'], self.weights['entity_embed']], axis=0)
+    #     all_embeddings = [ego_embeddings]
 
-        for k in range(0, self.n_layers):
-            # A_hat_drop = tf.nn.dropout(A_hat, 1 - self.node_dropout[k], [self.n_users + self.n_items, 1])
-            temp_embed = []
-            for f in range(self.n_fold):
-                temp_embed.append(tf.sparse_tensor_dense_matmul(A_fold_hat[f], ego_embeddings))
+    #     for k in range(0, self.n_layers):
+    #         # A_hat_drop = tf.nn.dropout(A_hat, 1 - self.node_dropout[k], [self.n_users + self.n_items, 1])
+    #         temp_embed = []
+    #         for f in range(self.n_fold):
+    #             temp_embed.append(tf.sparse_tensor_dense_matmul(A_fold_hat[f], ego_embeddings))
 
-            # sum messages of neighbors.
-            side_embeddings = tf.concat(temp_embed, 0)
+    #         # sum messages of neighbors.
+    #         side_embeddings = tf.concat(temp_embed, 0)
 
-            add_embeddings = ego_embeddings + side_embeddings
+    #         add_embeddings = ego_embeddings + side_embeddings
 
-            # transformed sum messages of neighbors.
-            sum_embeddings = tf.nn.leaky_relu(
-                tf.matmul(add_embeddings, self.weights['W_gc_%d' % k]) + self.weights['b_gc_%d' % k])
+    #         # transformed sum messages of neighbors.
+    #         sum_embeddings = tf.nn.leaky_relu(
+    #             tf.matmul(add_embeddings, self.weights['W_gc_%d' % k]) + self.weights['b_gc_%d' % k])
 
 
-            # bi messages of neighbors.
-            bi_embeddings = tf.multiply(ego_embeddings, side_embeddings)
-            # transformed bi messages of neighbors.
-            bi_embeddings = tf.nn.leaky_relu(
-                tf.matmul(bi_embeddings, self.weights['W_bi_%d' % k]) + self.weights['b_bi_%d' % k])
+    #         # bi messages of neighbors.
+    #         bi_embeddings = tf.multiply(ego_embeddings, side_embeddings)
+    #         # transformed bi messages of neighbors.
+    #         bi_embeddings = tf.nn.leaky_relu(
+    #             tf.matmul(bi_embeddings, self.weights['W_bi_%d' % k]) + self.weights['b_bi_%d' % k])
 
-            ego_embeddings = bi_embeddings + sum_embeddings
-            # message dropout.
-            ego_embeddings = tf.nn.dropout(ego_embeddings, 1 - self.mess_dropout[k])
+    #         ego_embeddings = bi_embeddings + sum_embeddings
+    #         # message dropout.
+    #         ego_embeddings = tf.nn.dropout(ego_embeddings, 1 - self.mess_dropout[k])
 
-            # normalize the distribution of embeddings.
-            norm_embeddings = tf.math.l2_normalize(ego_embeddings, axis=1)
+    #         # normalize the distribution of embeddings.
+    #         norm_embeddings = tf.math.l2_normalize(ego_embeddings, axis=1)
 
-            all_embeddings += [norm_embeddings]
+    #         all_embeddings += [norm_embeddings]
 
-        all_embeddings = tf.concat(all_embeddings, 1)
+    #     all_embeddings = tf.concat(all_embeddings, 1)
 
-        ja_embeddings, ea_embeddings = tf.split(all_embeddings, [self.n_jobs, self.n_entities], 0)
-        return ja_embeddings, ea_embeddings
+    #     ja_embeddings, ea_embeddings = tf.split(all_embeddings, [self.n_jobs, self.n_entities], 0)
+    #     return ja_embeddings, ea_embeddings
 
-    def _create_gcn_embed(self):
-        A = self.A_in
-        # Generate a set of adjacency sub-matrix.
-        A_fold_hat = self._split_A_hat(A)
+    # def _create_gcn_embed(self):
+    #     A = self.A_in
+    #     # Generate a set of adjacency sub-matrix.
+    #     A_fold_hat = self._split_A_hat(A)
 
-        embeddings = tf.concat([self.weights['job_embed'], self.weights['entity_embed']], axis=0)
-        all_embeddings = [embeddings]
+    #     embeddings = tf.concat([self.weights['job_embed'], self.weights['entity_embed']], axis=0)
+    #     all_embeddings = [embeddings]
 
-        for k in range(0, self.n_layers):
-            # A_hat_drop = tf.nn.dropout(A_hat, 1 - self.node_dropout[k], [self.n_users + self.n_items, 1])
-            temp_embed = []
-            for f in range(self.n_fold):
-                temp_embed.append(tf.sparse_tensor_dense_matmul(A_fold_hat[f], embeddings))
+    #     for k in range(0, self.n_layers):
+    #         # A_hat_drop = tf.nn.dropout(A_hat, 1 - self.node_dropout[k], [self.n_users + self.n_items, 1])
+    #         temp_embed = []
+    #         for f in range(self.n_fold):
+    #             temp_embed.append(tf.sparse_tensor_dense_matmul(A_fold_hat[f], embeddings))
 
-            embeddings = tf.concat(temp_embed, 0)
-            embeddings = tf.nn.leaky_relu(
-                tf.matmul(embeddings, self.weights['W_gc_%d' % k]) + self.weights['b_gc_%d' % k])
-            embeddings = tf.nn.dropout(embeddings, 1 - self.mess_dropout[k])
+    #         embeddings = tf.concat(temp_embed, 0)
+    #         embeddings = tf.nn.leaky_relu(
+    #             tf.matmul(embeddings, self.weights['W_gc_%d' % k]) + self.weights['b_gc_%d' % k])
+    #         embeddings = tf.nn.dropout(embeddings, 1 - self.mess_dropout[k])
 
-            # normalize the distribution of embeddings.
-            norm_embeddings = tf.math.l2_normalize(embeddings, axis=1)
+    #         # normalize the distribution of embeddings.
+    #         norm_embeddings = tf.math.l2_normalize(embeddings, axis=1)
 
-            all_embeddings += [norm_embeddings]
+    #         all_embeddings += [norm_embeddings]
 
-        all_embeddings = tf.concat(all_embeddings, 1)
+    #     all_embeddings = tf.concat(all_embeddings, 1)
 
-        ua_embeddings, ea_embeddings = tf.split(all_embeddings, [self.n_users, self.n_entities], 0)
-        return ua_embeddings, ea_embeddings
+    #     ua_embeddings, ea_embeddings = tf.split(all_embeddings, [self.n_users, self.n_entities], 0)
+    #     return ua_embeddings, ea_embeddings
 
     def _create_graphsage_embed(self):
         pass
 
-    def _split_A_hat(self, X):
-        A_fold_hat = []
-
-        fold_len = (self.n_jobs + self.n_entities) // self.n_fold
-
-        # Chuyển sang CSR để hỗ trợ slicing
+    def _split_A_hat(self, X, total_nodes=None):
+        # tổng số hàng cần chia
+        if total_nodes is None:
+            total_nodes = X.shape[0]
+        fold_len = total_nodes // self.n_fold
         X_csr = X.tocsr()
-
+        A_fold_hat = []
         for i_fold in range(self.n_fold):
             start = i_fold * fold_len
-            if i_fold == self.n_fold - 1:
-                end = self.n_jobs + self.n_entities
-            else:
-                end = (i_fold + 1) * fold_len
-
-            A_fold_hat.append(self._convert_sp_mat_to_sp_tensor(X_csr[start:end, :]))
-
+            end   = total_nodes if i_fold == self.n_fold - 1 else (i_fold + 1) * fold_len
+            block = X_csr[start:end, :]
+            A_fold_hat.append(self._convert_sp_mat_to_sp_tensor(block))
         return A_fold_hat
+
 
 
     def _convert_sp_mat_to_sp_tensor(self, X):
         coo = X.tocoo().astype(np.float32)
-        indices = np.mat([coo.row, coo.col]).transpose()
-        return tf.SparseTensor(indices, coo.data, coo.shape)
+        indices = np.vstack((coo.row, coo.col)).T.astype(np.int64)
+        values  = coo.data.astype(np.float32)
+        shape   = coo.shape
+        return tf.SparseTensor(indices=indices, values=values, dense_shape=shape)
 
     def _create_attentive_A_out(self):
-        indices = np.mat([self.all_h_list, self.all_t_list]).transpose()
-        A = tf.sparse.softmax(tf.SparseTensor(indices, self.A_values, self.A_in.shape))
+        # indices = np.mat([self.all_h_list, self.all_t_list]).transpose()
+        # A = tf.sparse.softmax(tf.SparseTensor(indices, self.A_values, self.A_in.shape))
+        indices = np.vstack((self.kg_h, self.kg_t)).T.astype(np.int64)
+        A = tf.sparse.softmax(
+            tf.SparseTensor(indices, self.A_values, dense_shape=self.A_kg.shape)
+        )
+
         return A
 
     def _generate_transE_score(self, h, t, r):
@@ -441,33 +495,47 @@ class KGAT(object):
         return batch_predictions
 
     def update_attentive_A(self, sess):
-        fold_len = len(self.all_h_list) // self.n_fold
+        # fold_len = len(self.all_h_list) // self.n_fold
+        fold_len = len(self.kg_h) // self.n_fold
         kg_score = []
 
         for i_fold in range(self.n_fold):
+            # start = i_fold * fold_len
+            # if i_fold == self.n_fold - 1:
+            #     end = len(self.all_h_list)
+            # else:
+            #     end = (i_fold + 1) * fold_len
+
             start = i_fold * fold_len
-            if i_fold == self.n_fold - 1:
-                end = len(self.all_h_list)
-            else:
-                end = (i_fold + 1) * fold_len
+            end = len(self.kg_h) if i_fold == self.n_fold - 1 else (i_fold + 1) * fold_len
+
 
             feed_dict = {
-                self.h: self.all_h_list[start:end],
-                self.r: self.all_r_list[start:end],
-                self.pos_t: self.all_t_list[start:end]
+                # self.h: self.all_h_list[start:end],
+                # self.r: self.all_r_list[start:end],
+                # self.pos_t: self.all_t_list[start:end]
+                self.h: self.kg_h[start:end],
+                self.r: self.kg_r[start:end],
+                self.pos_t: self.kg_t[start:end]
             }
             A_kg_score = sess.run(self.A_kg_score, feed_dict=feed_dict)
             kg_score += list(A_kg_score)
 
         kg_score = np.array(kg_score)
 
+        # new_A = sess.run(self.A_out, feed_dict={self.A_values: kg_score})
+        # new_A_values = new_A.values
+        # new_A_indices = new_A.indices4
+
         new_A = sess.run(self.A_out, feed_dict={self.A_values: kg_score})
         new_A_values = new_A.values
         new_A_indices = new_A.indices
 
-        rows = new_A_indices[:, 0]
-        cols = new_A_indices[:, 1]
-        self.A_in = sp.coo_matrix((new_A_values, (rows, cols)), shape=(self.n_jobs + self.n_entities,
-                                                                       self.n_jobs + self.n_entities))
-        if self.alg_type in ['org', 'gcn']:
-            self.A_in.setdiag(1.)
+        # rows = new_A_indices[:, 0]
+        # cols = new_A_indices[:, 1]
+        # self.A_in = sp.coo_matrix((new_A_values, (rows, cols)), shape=(self.n_jobs + self.n_entities,
+        #                                                                self.n_jobs + self.n_entities))
+
+        rows, cols = new_A_indices[:,0], new_A_indices[:,1]
+        # Cập nhật A_kg để phase II tiếp tục dùng
+        self.A_kg = sp.coo_matrix((new_A_values, (rows, cols)), shape=self.A_kg.shape)
